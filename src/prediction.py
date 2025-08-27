@@ -41,12 +41,16 @@ def _download_csv(df: pd.DataFrame, filename: str = "sentiment_predictions.csv")
     st.download_button("⬇️ Download CSV", data=csv, file_name=filename, mime="text/csv")
 
 # ====== Model Loader ======
-def _load_tf():
+def _setup_environment():
     import os
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+    os.environ.setdefault("KERAS_BACKEND", "tensorflow")
+    
+    # Import setelah set environment
+    import keras
     import tensorflow as tf
     tf.get_logger().setLevel("ERROR")
-    return tf
+    return keras
 
 def _load_meta() -> Dict[str, Any]:
     if META_PATH.exists():
@@ -58,43 +62,36 @@ def _load_meta() -> Dict[str, Any]:
 
 @st.cache_resource(show_spinner=False)
 def _load_model_and_meta():
-    tf = _load_tf()
+    keras = _setup_environment()
+    
     if not MODEL_PATH.exists():
         st.error(f"Model tidak ditemukan di {MODEL_PATH}.")
         st.stop()
 
-    # Coba beberapa approach loading untuk handle compatibility issues
     try:
-        # Approach 1: Standard loading dengan compile=False
-        model = tf.keras.models.load_model(
+        # Approach untuk Keras 3
+        model = keras.models.load_model(
             MODEL_PATH,
             compile=False,
-            custom_objects={"Functional": tf.keras.Model}
+            safe_mode=False
         )
+        
     except Exception as e:
-        try:
-            # Approach 2: Coba tanpa custom_objects
-            model = tf.keras.models.load_model(
-                MODEL_PATH,
-                compile=False
-            )
-        except Exception as e2:
-            try:
-                # Approach 3: Coba dengan safe_mode=False untuk handle batch_shape issue
-                model = tf.keras.models.load_model(
-                    MODEL_PATH,
-                    compile=False,
-                    safe_mode=False
-                )
-            except Exception as e3:
-                st.error(f"Gagal memuat model Keras dari `{MODEL_PATH}`.\nDetail: {e3}")
-                st.stop()
+        st.error(f"Gagal memuat model: {e}")
+        st.info("""
+        **Troubleshooting:**
+        1. Pastikan model dibuat dengan Keras 3
+        2. Coba convert model ke format lain jika perlu
+        """)
+        st.stop()
 
-    # Validasi bahwa model memiliki layer TextVectorization
-    has_tv = any(layer.__class__.__name__ == "TextVectorization" for layer in model.layers)
-    if not has_tv:
-        st.warning("Model tidak berisi layer TextVectorization. Pastikan preprocessing dilakukan secara external.")
-        # Lanjutkan tanpa error, mungkin preprocessing dilakukan di luar model
+    # Validasi model
+    try:
+        # Test prediction sederhana
+        test_texts = ["test prediction"]
+        _ = model.predict(np.array(test_texts, dtype=object), verbose=0)
+    except Exception as e:
+        st.warning(f"Test prediction warning: {e}")
 
     meta = _load_meta()
     id2sent = {int(k): str(v) for k, v in meta.get("label_map", ID2SENT_DEFAULT).items()}
@@ -102,14 +99,15 @@ def _load_model_and_meta():
 
 # ====== Inference ======
 def _predict_texts(model, texts: List[str], id2sent: Dict[int, str]) -> pd.DataFrame:
-    import tensorflow as tf
-    arr = tf.constant([str(t) for t in texts], dtype=tf.string)
+    import numpy as np
+    
+    # Convert ke numpy array dengan dtype object untuk string
+    arr = np.array([str(t) for t in texts], dtype=object)
     
     try:
         probs = model.predict(arr, verbose=0)
     except Exception as e:
         st.error(f"Error selama prediksi: {e}")
-        # Fallback: return dataframe kosong
         return pd.DataFrame({
             "pred_sent": ["error"] * len(texts),
             "p_neg": [0.0] * len(texts),
@@ -117,26 +115,40 @@ def _predict_texts(model, texts: List[str], id2sent: Dict[int, str]) -> pd.DataF
             "p_pos": [0.0] * len(texts),
         })
     
+    # Handle output shape
     if probs.shape[1] != 3:
-        st.warning(f"Model mengeluarkan {probs.shape[1]} kelas; diharapkan 3. Melanjutkan dengan mapping default.")
-        # Handle kasus dimana output shape tidak sesuai
+        st.warning(f"Model output shape: {probs.shape}, expected 3 classes")
         yhat = probs.argmax(axis=1)
         pred_sent = [f"class_{int(i)}" for i in yhat]
+        
+        # Create probability columns based on actual output shape
+        prob_cols = {}
+        for i in range(min(probs.shape[1], 3)):
+            prob_cols[f"p_{i}"] = probs[:, i]
+        
+        # Fill missing columns with zeros
+        for col in ["p_neg", "p_neu", "p_pos"]:
+            if col not in prob_cols:
+                prob_cols[col] = [0.0] * len(texts)
+                
+        return pd.DataFrame({
+            "pred_sent": pred_sent,
+            **prob_cols
+        })
     else:
         yhat = probs.argmax(axis=1)
         pred_sent = [id2sent.get(int(i), f"class_{int(i)}") for i in yhat]
-    
-    return pd.DataFrame({
-        "pred_sent": pred_sent,
-        "p_neg": probs[:, 0] if probs.shape[1] >= 1 else [0.0] * len(texts),
-        "p_neu": probs[:, 1] if probs.shape[1] >= 2 else [0.0] * len(texts),
-        "p_pos": probs[:, 2] if probs.shape[1] >= 3 else [0.0] * len(texts),
-    })
+        
+        return pd.DataFrame({
+            "pred_sent": pred_sent,
+            "p_neg": probs[:, 0],
+            "p_neu": probs[:, 1],
+            "p_pos": probs[:, 2],
+        })
 
 # ====== Streamlit Page ======
 def run():
     st.header("Prediction — Sentiment 3-Class")
-    st.caption("Label: 0=negative, 1=neutral, 2=positive")
     
     try:
         model, id2sent, meta = _load_model_and_meta()
@@ -194,7 +206,6 @@ def run():
                     st.dataframe(out.head(25), use_container_width=True)
                     _download_csv(out)
 
-# Debug manual
 if __name__ == "__main__":
     st.set_page_config(page_title="Sentiment Prediction", layout="wide")
     run()
