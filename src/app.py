@@ -10,9 +10,9 @@ st.set_page_config(
 
 # Dukung run dari root ataupun dari folder deployment
 try:
-    home = importlib.import_module("deployment.home")
-    eda  = importlib.import_module("deployment.eda")
-    pred = importlib.import_module("deployment.prediction")
+    home = importlib.import_module("src.home")
+    eda  = importlib.import_module("src.eda")
+    pred = importlib.import_module("src.prediction")
 except Exception:
     import home, eda
     import prediction as pred
